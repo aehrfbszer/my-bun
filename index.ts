@@ -8,17 +8,12 @@ for (let char of "👨‍👩‍👧‍👦") {
   console.log(char);
 }
 
-console.log(
-  Bun.version,
-  Bun.revision,
-  Bun.which("ls")
-)
+console.log(Bun.version, Bun.revision, Bun.which("ls"));
 
 const currentFile = import.meta.url;
 Bun.openInEditor(currentFile);
 
 await Bun.sleep(20_000);
-
 
 // const childProc = Bun.spawn(["bun", "child.ts"], {
 //   ipc(message, childProc) {
