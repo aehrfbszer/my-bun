@@ -16,6 +16,7 @@ const AUTH_NONE = 0x00;
 const AUTH_USER_PASS = 0x02;
 const AUTH_FAIL = 0xff;
 const CONNECT = 0x01;
+const BIND = 0x02;
 const UDP_ASSOCIATE = 0x03;
 const IPV4 = 0x01;
 const DOMAIN = 0x03;
@@ -95,7 +96,8 @@ type SocketData = {
   isHandshakeDone: boolean;
   tcpSocket?: Bun.TCPSocket;
   udpSocket?: Bun.udp.Socket<"uint8array">;
-  socketType?: "tcp" | "udp";
+  socketType?: "tcp" | "udp" | "bind";
+  bindServer?: Bun.TCPSocketListener;
 };
 
 Bun.listen<SocketData>({
@@ -212,6 +214,62 @@ Bun.listen<SocketData>({
               localSocket.write(reply(ERR_CONN_REFUSED));
               localSocket.end();
             }
+          } else if (cmd === BIND) {
+            try {
+              const bindServer = Bun.listen({
+                hostname: "::",
+                port: 0,
+                socket: {
+                  binaryType: "uint8array",
+                  open(boundSocket) {
+                    // 发送第二个回复：连接已建立
+                    localSocket.write(reply(SUCCESS));
+                    localSocket.data.tcpSocket = boundSocket;
+                    console.log(`[BIND] 远程连接建立，准备转发数据`);
+                  },
+                  data(boundSocket, data: Uint8Array) {
+                    localSocket.write(data);
+                  },
+                  close(boundSocket) {
+                    console.log("BIND remote closed");
+                    localSocket.end();
+                  },
+                  error(boundSocket, err) {
+                    console.error("BIND socket error:", err);
+                    localSocket.write(reply(ERR_GENERAL));
+                    localSocket.end();
+                  },
+                },
+              });
+
+              // 发送第一个回复：BND.ADDR 和 BND.PORT
+              const bndAddr = bindServer.hostname;
+              let IPFamily = IPV4;
+              let addrBytes: Uint8Array;
+              if (bndAddr.includes(":")) {
+                IPFamily = IPV6;
+                addrBytes = encodeIPv6(bndAddr);
+              } else {
+                IPFamily = IPV4;
+                const parts = bndAddr.split(".").map(Number);
+                addrBytes = new Uint8Array(parts);
+              }
+              const res = new Uint8Array(4 + addrBytes.length + 2);
+              const dataView = new DataView(res.buffer);
+              res.set([VER, SUCCESS, 0, IPFamily], 0);
+              res.set(addrBytes, 4);
+              dataView.setUint16(4 + addrBytes.length, bindServer.port, false);
+              localSocket.write(res);
+
+              localSocket.data.bindServer = bindServer;
+              localSocket.data.isHandshakeDone = true;
+              localSocket.data.socketType = "bind";
+              console.log(`[BIND] 绑定端口 ${bndAddr}:${bindServer.port} 成功`);
+            } catch (e) {
+              console.error("BIND error:", e);
+              localSocket.write(reply(ERR_GENERAL));
+              localSocket.end();
+            }
           } else if (cmd === UDP_ASSOCIATE) {
             console.log(
               `[UDP+++++++] ${localSocket.remoteAddress}:${localSocket.remotePort} 请求 UDP 关联`,
@@ -311,6 +369,12 @@ Bun.listen<SocketData>({
             return;
           }
 
+          if (localSocket.data.socketType === "bind" && !localSocket.data.tcpSocket) {
+            console.error("Received data on a BIND socket before remote connection, closing");
+            localSocket.end();
+            return;
+          }
+
           //   console.log(`[TCP] 转发数据到 ${client.remoteAddress}:${client.remotePort}`);
           const tcpSocket = localSocket.data.tcpSocket;
           if (tcpSocket) {
@@ -339,6 +403,9 @@ Bun.listen<SocketData>({
       if (socket.data.udpSocket) {
         socket.data.udpSocket.close();
       }
+      if (socket.data.bindServer) {
+        socket.data.bindServer.stop();
+      }
     },
     error(socket, err) {
       console.error("[err]", err);
@@ -347,6 +414,9 @@ Bun.listen<SocketData>({
       }
       if (socket.data.udpSocket) {
         socket.data.udpSocket.close();
+      }
+      if (socket.data.bindServer) {
+        socket.data.bindServer.stop();
       }
     },
   },
