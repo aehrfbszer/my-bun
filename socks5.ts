@@ -60,25 +60,13 @@ function parseAddr(data: Uint8Array) {
   }
 
   const port = dataView.getUint16(portOffset, false); // big-endian
-  return { host, port, len: portOffset + 2 };
+  return { host, port, offset: portOffset + 2 };
 }
 
 // 响应包
-function reply(code: number, bndAddr?: string, bndPort?: number) {
+function reply(code: number) {
   const buf = new Uint8Array(10);
-  buf[0] = VER;
-  buf[1] = code;
-  buf[2] = 0;
-  buf[3] = IPV4;
-  if (bndAddr && bndPort !== undefined) {
-    const parts = bndAddr.split(".").map(Number);
-    buf[4] = parts[0] || 0;
-    buf[5] = parts[1] || 0;
-    buf[6] = parts[2] || 0;
-    buf[7] = parts[3] || 0;
-    buf[8] = (bndPort >> 8) & 0xff;
-    buf[9] = bndPort & 0xff;
-  }
+  buf.set([VER, code, 0, IPV4], 0); // 默认回复 IPv4
   return buf;
 }
 
@@ -92,10 +80,10 @@ function encodeIPv6(addr: string) {
   const zeros = new Array(8 - left.length - right.length).fill("0");
   const groups = [...left, ...zeros, ...right];
   const buf = new Uint8Array(16);
+  const dataView = new DataView(buf.buffer);
   for (let i = 0; i < 8; i++) {
     const val = parseInt(groups[i] || "0", 16);
-    buf[i * 2] = (val >> 8) & 0xff;
-    buf[i * 2 + 1] = val & 0xff;
+    dataView.setUint16(i * 2, val, false); // big-endian
   }
   return buf;
 }
@@ -114,75 +102,76 @@ Bun.listen<SocketData>({
   hostname: CONFIG.host,
   port: CONFIG.port,
   socket: {
-    async data(client, data) {
-      const stage = client.data.stage || 0;
+    binaryType: "uint8array",
+    async data(localSocket, clientData: Uint8Array) {
+      const stage = localSocket.data.stage || 0;
 
       // 握手
       if (stage === 0) {
-        if (data[0] !== VER) {
-          console.error("Unsupported SOCKS version:", data[0]);
-          client.end();
+        if (clientData[0] !== VER) {
+          console.error("Unsupported SOCKS version:", clientData[0]);
+          localSocket.end();
           return;
         }
-        if (!data[1]) {
+        if (!clientData[1]) {
           console.error("No authentication methods provided");
-          client.end();
+          localSocket.end();
           return;
         }
-        const methods = data.subarray(2, 2 + data[1]);
+        const methods = clientData.subarray(2, 2 + clientData[1]);
         const needAuth = CONFIG.auth.enabled;
         const ok = needAuth ? methods.includes(AUTH_USER_PASS) : methods.includes(AUTH_NONE);
 
-        client.write(
+        localSocket.write(
           new Uint8Array([VER, ok ? (needAuth ? AUTH_USER_PASS : AUTH_NONE) : AUTH_FAIL]),
         );
         if (!ok) {
           console.error("No acceptable authentication method");
-          client.end();
+          localSocket.end();
           return;
         }
-        client.data.stage = needAuth ? 1 : 2;
+        localSocket.data.stage = needAuth ? 1 : 2;
         console.log(
-          `[TCP] ${client.remoteAddress}:${client.remotePort} 连接成功，认证方式: ${needAuth ? "用户名密码" : "无"}`,
+          `[TCP] ${localSocket.remoteAddress}:${localSocket.remotePort} 连接成功，认证方式: ${needAuth ? "用户名密码" : "无"}`,
         );
       }
 
       // 认证
       else if (stage === 1) {
-        const ulen = data[1];
-        if (!ulen || data.length < 2 + ulen + 1) {
-          client.write(new Uint8Array([1, AUTH_FAIL]));
-          client.end();
+        const ulen = clientData[1];
+        if (!ulen || clientData.length < 2 + ulen + 1) {
+          localSocket.write(new Uint8Array([1, AUTH_FAIL]));
+          localSocket.end();
           return;
         }
-        const user = new TextDecoder().decode(data.subarray(2, 2 + ulen));
-        const plen = data[2 + ulen];
-        if (!plen || data.length < 3 + ulen + plen) {
-          client.write(new Uint8Array([1, AUTH_FAIL]));
-          client.end();
+        const user = new TextDecoder().decode(clientData.subarray(2, 2 + ulen));
+        const plen = clientData[2 + ulen];
+        if (!plen || clientData.length < 3 + ulen + plen) {
+          localSocket.write(new Uint8Array([1, AUTH_FAIL]));
+          localSocket.end();
           return;
         }
-        const pass = new TextDecoder().decode(data.subarray(3 + ulen, 3 + ulen + plen));
+        const pass = new TextDecoder().decode(clientData.subarray(3 + ulen, 3 + ulen + plen));
         const success = user === CONFIG.auth.username && pass === CONFIG.auth.password;
 
-        client.write(new Uint8Array([1, success ? 0 : 1]));
+        localSocket.write(new Uint8Array([1, success ? 0 : 1]));
         if (!success) {
-          client.end();
+          localSocket.end();
           return;
         }
-        client.data.stage = 2;
+        localSocket.data.stage = 2;
       }
 
       // 请求
       else if (stage === 2) {
-        if (!client.data.isHandshakeDone) {
-          const addr = parseAddr(data);
+        if (!localSocket.data.isHandshakeDone) {
+          const addr = parseAddr(clientData);
           if (!addr) {
-            client.write(reply(ERR_GENERAL));
-            client.end();
+            localSocket.write(reply(ERR_GENERAL));
+            localSocket.end();
             return;
           }
-          const cmd = data[1];
+          const cmd = clientData[1];
 
           if (cmd === CONNECT) {
             try {
@@ -190,45 +179,43 @@ Bun.listen<SocketData>({
                 hostname: addr.host,
                 port: addr.port,
                 socket: {
+                  binaryType: "uint8array",
                   open(remote) {
                     console.log(`[TCP] ${addr.host}:${addr.port} 连接建立`);
                   },
-                  data(remote, data) {
+                  data(remote, data: Uint8Array) {
                     // console.log(`[TCP] 远程数据: ${data.length} bytes`);
-                    try {
-                      client.write(data);
-                    } catch (e) {
-                      console.error("Client write error:", e);
-                      remote.end();
-                    }
+                    localSocket.write(data);
                   },
                   error(remote, err) {
                     console.error("TCP connection error:", err);
-                    client.write(reply(ERR_CONN_REFUSED));
-                    client.end();
+                    localSocket.write(reply(ERR_CONN_REFUSED));
+                    localSocket.end();
                   },
                   close(remote) {
                     console.log("Remote closed");
-                    client.end();
+                    localSocket.end();
                   },
                 },
               });
 
-              client.write(reply(SUCCESS));
+              localSocket.write(reply(SUCCESS));
 
               console.log(
                 `[TCP] ${addr.host}:${addr.port} 连接成功,准备转发数据 BND: port:${tcpRedirect.localPort}`,
               );
-              client.data.tcpSocket = tcpRedirect;
-              client.data.isHandshakeDone = true;
-              client.data.socketType = "tcp";
+              localSocket.data.tcpSocket = tcpRedirect;
+              localSocket.data.isHandshakeDone = true;
+              localSocket.data.socketType = "tcp";
             } catch (e) {
               console.error("Failed to establish connection:", addr.host, addr.port, e);
-              client.write(reply(ERR_CONN_REFUSED));
-              client.end();
+              localSocket.write(reply(ERR_CONN_REFUSED));
+              localSocket.end();
             }
           } else if (cmd === UDP_ASSOCIATE) {
-            console.log(`[UDP+++++++] ${client.remoteAddress}:${client.remotePort} 请求 UDP 关联`);
+            console.log(
+              `[UDP+++++++] ${localSocket.remoteAddress}:${localSocket.remotePort} 请求 UDP 关联`,
+            );
 
             try {
               const udpRedirect = await Bun.udpSocket({
@@ -236,20 +223,21 @@ Bun.listen<SocketData>({
                 hostname: "::",
                 binaryType: "uint8array",
                 socket: {
-                  data: async (socks5, data, port, host) => {
-                    console.log(`[UDP] 收到数据 ${data.length} bytes 来自 ${host}:${port}`);
-                    if (data[0] || data[1] || data[2]) {
+                  data: async (socks5, clientUdpData, port, host) => {
+                    // console.log(`[UDP] 收到数据 ${data.length} bytes 来自 ${host}:${port}`);
+                    if (clientUdpData[0] || clientUdpData[1] || clientUdpData[2]) {
+                      // 不支持分片的 UDP 数据包，RSV 必须为 0，FRAG 必须为 0
                       console.error("Invalid UDP packet header");
                       socks5.close();
                       return;
                     }
-                    const addr = parseAddr(data);
+                    const addr = parseAddr(clientUdpData);
                     if (!addr) {
                       console.error("Invalid UDP packet address");
                       socks5.close();
                       return;
                     }
-                    const payload = data.subarray(addr.len);
+                    const payload = clientUdpData.subarray(addr.offset);
 
                     const udpClient = await Bun.udpSocket({
                       port: 0,
@@ -257,11 +245,11 @@ Bun.listen<SocketData>({
                       binaryType: "uint8array",
                       socket: {
                         data(out, res) {
-                          const addrBuf = data.subarray(3, addr.len); // ATYP + DST.ADDR + DST.PORT
+                          const addrBuf = clientUdpData.subarray(3, addr.offset); // ATYP + DST.ADDR + DST.PORT
                           const packet = new Uint8Array(3 + addrBuf.length + res.length);
-                          packet[0] = 0; // RSV
-                          packet[1] = 0; // RSV
-                          packet[2] = 0; // FRAG
+                          const dataView = new DataView(packet.buffer);
+                          dataView.setUint16(0, 0); // RSV
+                          dataView.setUint8(2, 0); // FRAG
                           packet.set(addrBuf, 3); // ATYP + DST.ADDR + DST.PORT
                           packet.set(res, 3 + addrBuf.length); // DATA'
 
@@ -279,54 +267,37 @@ Bun.listen<SocketData>({
                 },
               });
 
-              let ipArr: number[] = [];
               let IPFamily = IPV4;
-              switch (udpRedirect.address.family) {
-                case "IPv4":
-                  ipArr = udpRedirect.address.address.split(".").map(Number);
-                  IPFamily = IPV4;
-                  console.log(`[UDP] 监听在 ${udpRedirect.hostname}:${udpRedirect.port} (IPv4)`);
-                  break;
-                case "IPv6":
-                  ipArr = udpRedirect.address.address.split(":").map((x) => parseInt(x, 16));
-                  IPFamily = IPV6;
-                  console.log(`[UDP] 监听在 [${udpRedirect.hostname}]:${udpRedirect.port} (IPv6)`);
-                  break;
-                default:
-                  console.log(
-                    `[UDP] 监听在 ${udpRedirect.hostname}:${udpRedirect.port} (未知协议)`,
-                  );
-              }
 
               let addrBytes: Uint8Array;
               if (udpRedirect.address.family === "IPv6") {
+                IPFamily = IPV6;
+
                 addrBytes = encodeIPv6(udpRedirect.address.address);
               } else {
+                IPFamily = IPV4;
                 const parts = udpRedirect.address.address.split(".").map(Number);
                 addrBytes = new Uint8Array(parts);
               }
               const res = new Uint8Array(4 + addrBytes.length + 2);
-              res[0] = VER;
-              res[1] = SUCCESS;
-              res[2] = 0;
-              res[3] = IPFamily;
+              const dataView = new DataView(res.buffer);
+              res.set([VER, SUCCESS, 0, IPFamily], 0);
               res.set(addrBytes, 4);
-              res[4 + addrBytes.length] = (udpRedirect.port >> 8) & 0xff;
-              res[5 + addrBytes.length] = udpRedirect.port & 0xff;
-              client.write(res);
-              client.data.udpSocket = udpRedirect;
-              client.data.isHandshakeDone = true;
-              client.data.socketType = "udp";
+              dataView.setUint16(4 + addrBytes.length, udpRedirect.port, false); // big-endian
+              localSocket.write(res);
+              localSocket.data.udpSocket = udpRedirect;
+              localSocket.data.isHandshakeDone = true;
+              localSocket.data.socketType = "udp";
               console.log(`[UDP] ${addr.host}:${addr.port} 连接成功,准备转发数据`);
             } catch (e) {
               console.error("UDP association error:", e);
-              client.write(reply(ERR_GENERAL));
-              client.end();
+              localSocket.write(reply(ERR_GENERAL));
+              localSocket.end();
             }
           } else {
             console.error("Unsupported command:", cmd);
-            client.write(reply(ERR_CMD_NOT_SUPPORTED));
-            client.end();
+            localSocket.write(reply(ERR_CMD_NOT_SUPPORTED));
+            localSocket.end();
           }
         } else {
           //   console.log(
@@ -334,30 +305,24 @@ Bun.listen<SocketData>({
           //   );
 
           // 这是永远不会发生的情况，因为 UDP 数据包是通过独立的 UDP Socket 处理的，但为了代码健壮性，还是加个判断
-          if (client.data.socketType === "udp") {
-            // console.log(`[UDP] 转发数据到 ${client.remoteAddress}:${client.remotePort}`);
-            const udpSocket = client.data.udpSocket;
-            if (udpSocket) {
-              udpSocket.send(data, client.remotePort, client.remoteAddress);
-            } else {
-              console.error("No redirect udp socket for established connection");
-              client.end();
-            }
+          if (localSocket.data.socketType === "udp") {
+            console.error("Received TCP data on a UDP socket, closing");
+            localSocket.end();
             return;
           }
 
           //   console.log(`[TCP] 转发数据到 ${client.remoteAddress}:${client.remotePort}`);
-          const tcpSocket = client.data.tcpSocket;
+          const tcpSocket = localSocket.data.tcpSocket;
           if (tcpSocket) {
             try {
-              tcpSocket.write(data);
+              tcpSocket.write(clientData);
             } catch (e) {
               console.error("TCP write error:", e);
-              client.end();
+              localSocket.end();
             }
           } else {
             console.error("No redirect tcp socket for established connection");
-            client.end();
+            localSocket.end();
           }
         }
       }
@@ -375,10 +340,15 @@ Bun.listen<SocketData>({
         socket.data.udpSocket.close();
       }
     },
-    error(_, err) {
+    error(socket, err) {
       console.error("[err]", err);
+      if (socket.data.tcpSocket) {
+        socket.data.tcpSocket.end();
+      }
+      if (socket.data.udpSocket) {
+        socket.data.udpSocket.close();
+      }
     },
-    binaryType: "uint8array",
   },
 });
 
