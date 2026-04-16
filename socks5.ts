@@ -26,6 +26,56 @@ const ERR_GENERAL = 0x01;
 const ERR_CONN_REFUSED = 0x05;
 const ERR_CMD_NOT_SUPPORTED = 0x07;
 
+function buildAddr(host: string, port: number): Uint8Array {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const parts = host.split(".").map(Number);
+    if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+      const [a, b, c, d] = parts as [number, number, number, number];
+      const buf = new Uint8Array(7);
+      const view = new DataView(buf.buffer);
+      buf.set([IPV4, a, b, c, d]);
+      view.setUint16(5, port, false);
+      return buf;
+    }
+  }
+
+  if (host.includes(":")) {
+    const addr = encodeIPv6(host);
+    const buf = new Uint8Array(19);
+    const view = new DataView(buf.buffer);
+    buf.set([IPV6]);
+    buf.set(addr, 1);
+    view.setUint16(17, port, false);
+    return buf;
+  }
+
+  const hostBytes = new TextEncoder().encode(host);
+  const buf = new Uint8Array(2 + hostBytes.length + 2);
+  const view = new DataView(buf.buffer);
+  buf.set([DOMAIN, hostBytes.length]);
+  buf.set(hostBytes, 2);
+  view.setUint16(2 + hostBytes.length, port, false);
+  return buf;
+}
+
+function encodeIPv6(host: string): Uint8Array {
+  const parts = host.split("::");
+  if (parts.length > 2) {
+    throw new Error("Invalid IPv6 address");
+  }
+  const left = parts[0] ? parts[0].split(":").filter(Boolean) : [];
+  const right = parts[1] ? parts[1].split(":").filter(Boolean) : [];
+  const zeros = new Array(8 - left.length - right.length).fill("0");
+  const groups = [...left, ...zeros, ...right];
+  const buf = new Uint8Array(16);
+  const dataView = new DataView(buf.buffer);
+  for (let i = 0; i < 8; i++) {
+    const val = parseInt(groups[i] || "0", 16);
+    dataView.setUint16(i * 2, val, false);
+  }
+  return buf;
+}
+
 // 解析目标地址（纯 Bun Buffer）
 function parseAddr(data: Uint8Array) {
   const atyp = data[3];
@@ -65,27 +115,14 @@ function parseAddr(data: Uint8Array) {
 }
 
 // 响应包
-function reply(code: number) {
-  const buf = new Uint8Array(10);
-  buf.set([VER, code, 0, IPV4], 0); // 默认回复 IPv4
-  return buf;
-}
-
-function encodeIPv6(addr: string) {
-  const parts = addr.split("::");
-  if (parts.length > 2) {
-    throw new Error("Invalid IPv6 address");
+function reply(code: number, bndAddr?: string, bndPort?: number) {
+  let addr: Uint8Array<ArrayBufferLike> = new Uint8Array([IPV4, 0, 0, 0, 0, 0, 0]);
+  if (bndAddr && bndPort !== undefined) {
+    addr = buildAddr(bndAddr, bndPort);
   }
-  const left = parts[0] ? parts[0].split(":").filter(Boolean) : [];
-  const right = parts[1] ? parts[1].split(":").filter(Boolean) : [];
-  const zeros = new Array(8 - left.length - right.length).fill("0");
-  const groups = [...left, ...zeros, ...right];
-  const buf = new Uint8Array(16);
-  const dataView = new DataView(buf.buffer);
-  for (let i = 0; i < 8; i++) {
-    const val = parseInt(groups[i] || "0", 16);
-    dataView.setUint16(i * 2, val, false); // big-endian
-  }
+  const buf = new Uint8Array(4 + addr.length);
+  buf.set([VER, code, 0, addr[0] ?? IPV4]);
+  buf.set(addr.subarray(1), 4);
   return buf;
 }
 
@@ -223,11 +260,15 @@ Bun.listen<SocketData>({
                   binaryType: "uint8array",
                   open(boundSocket) {
                     // 发送第二个回复：连接已建立
-                    localSocket.write(reply(SUCCESS));
+                    localSocket.write(
+                      reply(SUCCESS, boundSocket.remoteAddress, boundSocket.remotePort),
+                    );
                     localSocket.data.tcpSocket = boundSocket;
                     console.log(`[BIND] 远程连接建立，准备转发数据`);
                   },
                   data(boundSocket, data: Uint8Array) {
+                    console.log(`[BIND] 转发数据 ${data.length} bytes`);
+                    console.log("BIND数据：", new TextDecoder().decode(data));
                     localSocket.write(data);
                   },
                   close(boundSocket) {
@@ -243,28 +284,12 @@ Bun.listen<SocketData>({
               });
 
               // 发送第一个回复：BND.ADDR 和 BND.PORT
-              const bndAddr = bindServer.hostname;
-              let IPFamily = IPV4;
-              let addrBytes: Uint8Array;
-              if (bndAddr.includes(":")) {
-                IPFamily = IPV6;
-                addrBytes = encodeIPv6(bndAddr);
-              } else {
-                IPFamily = IPV4;
-                const parts = bndAddr.split(".").map(Number);
-                addrBytes = new Uint8Array(parts);
-              }
-              const res = new Uint8Array(4 + addrBytes.length + 2);
-              const dataView = new DataView(res.buffer);
-              res.set([VER, SUCCESS, 0, IPFamily], 0);
-              res.set(addrBytes, 4);
-              dataView.setUint16(4 + addrBytes.length, bindServer.port, false);
-              localSocket.write(res);
+              localSocket.write(reply(SUCCESS, bindServer.hostname, bindServer.port));
 
               localSocket.data.bindServer = bindServer;
               localSocket.data.isHandshakeDone = true;
               localSocket.data.socketType = "bind";
-              console.log(`[BIND] 绑定端口 ${bndAddr}:${bindServer.port} 成功`);
+              console.log(`[BIND] 绑定端口 ${bindServer.hostname}:${bindServer.port} 成功`);
             } catch (e) {
               console.error("BIND error:", e);
               localSocket.write(reply(ERR_GENERAL));
@@ -325,23 +350,10 @@ Bun.listen<SocketData>({
                 },
               });
 
-              let IPFamily = IPV4;
-
-              let addrBytes: Uint8Array;
-              if (udpRedirect.address.family === "IPv6") {
-                IPFamily = IPV6;
-
-                addrBytes = encodeIPv6(udpRedirect.address.address);
-              } else {
-                IPFamily = IPV4;
-                const parts = udpRedirect.address.address.split(".").map(Number);
-                addrBytes = new Uint8Array(parts);
-              }
-              const res = new Uint8Array(4 + addrBytes.length + 2);
-              const dataView = new DataView(res.buffer);
-              res.set([VER, SUCCESS, 0, IPFamily], 0);
-              res.set(addrBytes, 4);
-              dataView.setUint16(4 + addrBytes.length, udpRedirect.port, false); // big-endian
+              const addrBuf = buildAddr(udpRedirect.address.address, udpRedirect.port);
+              const res = new Uint8Array(3 + addrBuf.length);
+              res.set([VER, SUCCESS, 0], 0);
+              res.set(addrBuf, 3);
               localSocket.write(res);
               localSocket.data.udpSocket = udpRedirect;
               localSocket.data.isHandshakeDone = true;
