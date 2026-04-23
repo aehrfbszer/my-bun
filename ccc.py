@@ -10,7 +10,7 @@ ECHO_SERVERS = [
     ("::1", 54322),
 ]
 DNS_SERVERS = [
-    ("8.8.8.8", 53),
+    ("dns.google", 53),
     ("2001:4860:4860::8888", 53),
 ]
 DNS_DOMAIN = "example.com"
