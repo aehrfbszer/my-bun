@@ -78,33 +78,50 @@ function encodeIPv6(host: string): Uint8Array {
 
 // 解析目标地址（纯 Bun Buffer）
 function parseAddr(data: Uint8Array) {
-  const atyp = data[3];
-  let host: string;
-  let portOffset = 4;
+  const subBuf = new Uint8Array(data.buffer, 3);
 
-  const dataView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const atyp = subBuf[0];
+  let host: string;
+  let portOffset = subBuf.byteOffset + 1; // ATYP 位置 + 1 字节
+
+  const dataView = new DataView(data.buffer);
 
   if (atyp === IPV4) {
-    if (data.length < 10) {
+    // IPv4 地址需要 4 字节 + 2 字节端口
+    if (data.length < portOffset + 4 + 2) {
       throw new Error("Invalid IPv4 address");
     }
-    host = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
+    host = `${subBuf[1]}.${subBuf[2]}.${subBuf[3]}.${subBuf[4]}`;
     portOffset += 4;
   } else if (atyp === DOMAIN) {
-    const len = data[4];
-    if (!len || data.length < 5 + len + 2) {
+    const len = subBuf[1];
+    // 域名地址需要 1 字节长度 + 域名 + 2 字节端口
+    console.warn(
+      "Domain address length:",
+      len,
+      "bytes",
+      data.length,
+      "bytes total",
+      portOffset,
+      len,
+    );
+    if (!len || data.length < portOffset + 1 + len + 2) {
       throw new Error("Invalid domain address");
     }
     portOffset += 1;
-    host = new TextDecoder().decode(data.subarray(5, 5 + len));
+    host = new TextDecoder().decode(subBuf.subarray(2, 2 + len));
     portOffset += len;
   } else if (atyp === IPV6) {
-    if (data.length < 22) {
+    // IPv6 地址需要 16 字节 + 2 字节端口
+    if (data.length < portOffset + 16 + 2) {
       throw new Error("Invalid IPv6 address");
     }
     const parts = [];
-    for (let i = 0; i < 16; i += 2) parts.push(dataView.getUint16(4 + i).toString(16));
+    for (let i = 0; i < 8; i++) {
+      parts.push(dataView.getUint16(portOffset + i * 2, false).toString(16));
+    }
     host = parts.join(":");
+    console.warn("Parsed IPv6 address:", host);
     portOffset += 16;
   } else {
     return null;
@@ -121,6 +138,7 @@ function tryParseAddr(data: Uint8Array) {
   try {
     return parseAddr(data);
   } catch (e) {
+    console.error("Address parsing error (possibly incomplete data):", e);
     return null; // 数据不完整，等待更多数据
   }
 }
@@ -144,7 +162,9 @@ function reply(code: number, bndAddr?: string, bndPort?: number) {
 function appendToBuffer(data: SocketData, newData: Uint8Array): void {
   if (data.bufferLen + newData.length > data.buffer.length) {
     // 缓冲区不够，扩容
-    const newBuffer = new Uint8Array(Math.max(data.buffer.length * 2, data.bufferLen + newData.length));
+    const newBuffer = new Uint8Array(
+      Math.max(data.buffer.length * 2, data.bufferLen + newData.length),
+    );
     newBuffer.set(data.buffer.subarray(0, data.bufferLen));
     data.buffer = newBuffer;
   }
@@ -181,7 +201,7 @@ type SocketData = {
   socketType?: "tcp" | "udp" | "bind";
   bindServer?: Bun.TCPSocketListener;
   buffer: Uint8Array; // 缓冲区，处理TCP分包
-  bufferLen: number;  // 当前缓冲区的有效数据长度
+  bufferLen: number; // 当前缓冲区的有效数据长度
 };
 
 Bun.listen<SocketData>({
@@ -191,7 +211,7 @@ Bun.listen<SocketData>({
     binaryType: "uint8array",
     async data(localSocket, clientData: Uint8Array) {
       const sockData = localSocket.data;
-      
+
       // 追加数据到缓冲区
       appendToBuffer(sockData, clientData);
       const bufferData = getBufferData(sockData);
@@ -202,25 +222,25 @@ Bun.listen<SocketData>({
         if (bufferData.length < 2) {
           return; // 等待更多数据
         }
-        
+
         if (bufferData[0] !== VER) {
           console.error("Unsupported SOCKS version:", bufferData[0]);
           localSocket.end();
           return;
         }
-        
+
         const nmethods = bufferData[1];
         if (!nmethods) {
           console.error("No authentication methods provided");
           localSocket.end();
           return;
         }
-        
+
         // 需要 2 + nmethods 字节
         if (bufferData.length < 2 + nmethods) {
           return; // 等待更多数据
         }
-        
+
         const methods = bufferData.subarray(2, 2 + nmethods);
         const needAuth = CONFIG.auth.enabled;
         const ok = needAuth ? methods.includes(AUTH_USER_PASS) : methods.includes(AUTH_NONE);
@@ -228,19 +248,20 @@ Bun.listen<SocketData>({
         localSocket.write(
           new Uint8Array([VER, ok ? (needAuth ? AUTH_USER_PASS : AUTH_NONE) : AUTH_FAIL]),
         );
-        
+
         if (!ok) {
           console.error("No acceptable authentication method");
           localSocket.end();
           return;
         }
-        
+
         // 消费缓冲区中的数据
         consumeBuffer(sockData, 2 + nmethods);
         sockData.stage = needAuth ? 1 : 2;
         console.log(
           `[TCP] ${localSocket.remoteAddress}:${localSocket.remotePort} 连接成功，认证方式: ${needAuth ? "用户名密码" : "无"}`,
         );
+        console.warn(sockData.bufferLen, "bytes remaining in buffer after handshake");
       }
 
       // 认证
@@ -249,54 +270,57 @@ Bun.listen<SocketData>({
         if (bufferData.length < 2) {
           return;
         }
-        
+
         const ulen = bufferData[1]!;
         if (!ulen || bufferData.length < 2 + ulen + 1) {
           return; // 等待更多数据（需要用户名长度）
         }
-        
+
         const plenIndex = 2 + ulen;
         if (plenIndex >= bufferData.length) {
           return; // 等待更多数据
         }
-        
+
         const plen = bufferData[plenIndex]!;
         // 需要 3 + ulen + plen 字节
         if (bufferData.length < 3 + ulen + plen) {
           return; // 等待更多数据（需要密码）
         }
-        
+
         const user = new TextDecoder().decode(bufferData.subarray(2, 2 + ulen));
         const pass = new TextDecoder().decode(bufferData.subarray(3 + ulen, 3 + ulen + plen));
         const success = user === CONFIG.auth.username && pass === CONFIG.auth.password;
 
         localSocket.write(new Uint8Array([1, success ? 0 : 1]));
-        
+
         if (!success) {
           localSocket.end();
           return;
         }
-        
+
         consumeBuffer(sockData, 3 + ulen + plen);
         sockData.stage = 2;
       }
 
       // 请求
       else if (sockData.stage === 2) {
+        console.log(`[TCP] 请求数据 ${bufferData.length} bytes`);
         if (!sockData.isHandshakeDone) {
           // 最少需要 4 字节：[VER, CMD, RSV, ATYP]
           if (bufferData.length < 4) {
             return; // 等待更多数据
           }
-          
+
           // 尝试解析地址，如果不完整则返回 null
           const parsed = tryParseAddr(bufferData);
+          console.log("Parsed request address:", parsed);
           if (!parsed) {
             return; // 等待更多数据
           }
-          
+
           const { host, port, offset: addrOffset } = parsed;
           const cmd = bufferData[1];
+          console.log("Processing SOCKS5 request...", { cmd });
 
           if (cmd === CONNECT) {
             try {
@@ -309,7 +333,10 @@ Bun.listen<SocketData>({
                     console.log(`[TCP] ${host}:${port} 连接建立`);
                   },
                   data(remote, data: Uint8Array) {
-                    // console.log(`[TCP] 远程数据: ${data.length} bytes`);
+                    console.log(
+                      `[TCP] 远程数据: ${data.length} bytes`,
+                      new TextDecoder().decode(data),
+                    );
                     localSocket.write(data);
                   },
                   error(remote, err) {
@@ -324,17 +351,19 @@ Bun.listen<SocketData>({
                 },
               });
 
-              localSocket.write(reply(SUCCESS));
-
               console.log(
                 `[TCP] ${host}:${port} 连接成功,准备转发数据 BND: port:${tcpRedirect.localPort}`,
               );
               sockData.tcpSocket = tcpRedirect;
               sockData.isHandshakeDone = true;
               sockData.socketType = "tcp";
-              
+
               // 消费缓冲区中已处理的请求数据
               consumeBuffer(sockData, addrOffset);
+
+              localSocket.write(reply(SUCCESS));
+
+              console.warn(sockData.bufferLen, "bytes remaining in buffer after request");
             } catch (e) {
               console.error("Failed to establish connection:", host, port, e);
               localSocket.write(reply(ERR_CONN_REFUSED));
@@ -372,14 +401,15 @@ Bun.listen<SocketData>({
                 },
               });
 
-              // 发送第一个回复：BND.ADDR 和 BND.PORT
-              localSocket.write(reply(SUCCESS, bindServer.hostname, bindServer.port));
-
               sockData.bindServer = bindServer;
               sockData.isHandshakeDone = true;
               sockData.socketType = "bind";
-              
+
               consumeBuffer(sockData, addrOffset);
+
+              // 发送第一个回复：BND.ADDR 和 BND.PORT
+              localSocket.write(reply(SUCCESS, bindServer.hostname, bindServer.port));
+
               console.log(`[BIND] 绑定端口 ${bindServer.hostname}:${bindServer.port} 成功`);
             } catch (e) {
               console.error("BIND error:", e);
@@ -445,12 +475,13 @@ Bun.listen<SocketData>({
               const res = new Uint8Array(3 + addrBuf.length);
               res.set([VER, SUCCESS, 0], 0);
               res.set(addrBuf, 3);
-              localSocket.write(res);
               sockData.udpSocket = udpRedirect;
               sockData.isHandshakeDone = true;
               sockData.socketType = "udp";
-              
+
               consumeBuffer(sockData, addrOffset);
+              localSocket.write(res);
+
               console.log(`[UDP] ${host}:${port} 连接成功,准备转发数据`);
             } catch (e) {
               console.error("UDP association error:", e);
@@ -480,8 +511,9 @@ Bun.listen<SocketData>({
           const tcpSocket = sockData.tcpSocket;
           if (tcpSocket) {
             try {
+              console.log(`[TCP] 转发数据 ${sockData.bufferLen} bytes`);
               // 转发缓冲区中的所有数据
-              tcpSocket.write(getBufferData(sockData));
+              tcpSocket.write(bufferData);
               // 清空缓冲区
               sockData.bufferLen = 0;
             } catch (e) {
