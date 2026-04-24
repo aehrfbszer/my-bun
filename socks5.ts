@@ -26,8 +26,20 @@ const ERR_GENERAL = 0x01;
 const ERR_CONN_REFUSED = 0x05;
 const ERR_CMD_NOT_SUPPORTED = 0x07;
 
+function getStrType(str: string) {
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(str)) {
+    return IPV4;
+  } else if (str.includes(":")) {
+    return IPV6;
+  } else {
+    return DOMAIN;
+  }
+}
+
 function buildAddr(host: string, port: number): Uint8Array {
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+  const type = getStrType(host);
+
+  if (type === IPV4) {
     const parts = host.split(".").map(Number);
     if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
       const [a, b, c, d] = parts as [number, number, number, number];
@@ -39,7 +51,7 @@ function buildAddr(host: string, port: number): Uint8Array {
     }
   }
 
-  if (host.includes(":")) {
+  if (type === IPV6) {
     const addr = encodeIPv6(host);
     const buf = new Uint8Array(19);
     const view = new DataView(buf.buffer);
@@ -74,6 +86,50 @@ function encodeIPv6(host: string): Uint8Array {
     dataView.setUint16(i * 2, val, false);
   }
   return buf;
+}
+
+function compressIPv6(ipv6: string): string {
+  // 将连续的多个全零组压缩为 ::
+  const parts = ipv6.split(":");
+  let bestStart = -1;
+  let bestLen = 0;
+
+  // 找到最长的连续零序列（至少2个或更多）
+  let currentStart = -1;
+  let currentLen = 0;
+
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === "0") {
+      if (currentStart === -1) {
+        currentStart = i;
+        currentLen = 1;
+      } else {
+        currentLen++;
+      }
+    } else {
+      if (currentLen >= 2 && currentLen > bestLen) {
+        // 只压缩2个或更多连续的零
+        bestStart = currentStart;
+        bestLen = currentLen;
+      }
+      currentStart = -1;
+      currentLen = 0;
+    }
+  }
+
+  // 检查末尾的零序列
+  if (currentLen >= 2 && currentLen > bestLen) {
+    bestStart = currentStart;
+    bestLen = currentLen;
+  }
+
+  if (bestLen >= 2) {
+    const before = parts.slice(0, bestStart);
+    const after = parts.slice(bestStart + bestLen);
+    return before.join(":") + "::" + after.join(":");
+  }
+
+  return ipv6;
 }
 
 // 解析目标地址（纯 Bun Buffer）
@@ -191,6 +247,29 @@ function getBufferData(data: SocketData): Uint8Array {
   return data.buffer.subarray(0, data.bufferLen);
 }
 
+class DNSCache {
+  #cache: Map<string, { ip: string; expires: number }>;
+  #ttl: number;
+
+  constructor(ttl: number = 5 * 60 * 1000) {
+    this.#cache = new Map();
+    this.#ttl = ttl;
+  }
+
+  get(hostname: string): string | null {
+    const entry = this.#cache.get(hostname);
+    if (entry && entry.expires > Date.now()) {
+      return entry.ip;
+    }
+    this.#cache.delete(hostname);
+    return null;
+  }
+
+  set(hostname: string, ip: string): void {
+    this.#cache.set(hostname, { ip, expires: Date.now() + this.#ttl });
+  }
+}
+
 // ============== SOCKS5 握手主逻辑 ==============
 
 type SocketData = {
@@ -202,6 +281,13 @@ type SocketData = {
   bindServer?: Bun.TCPSocketListener;
   buffer: Uint8Array; // 缓冲区，处理TCP分包
   bufferLen: number; // 当前缓冲区的有效数据长度
+  count: number; // 计数器
+  dnsCache: DNSCache; // 可选的 DNS 缓存
+  udpCache: Map<string, Bun.udp.ConnectedSocket<"uint8array">>; // UDP 关联的客户端地址缓存
+};
+
+const consoleLogRed = (msg: string) => {
+  console.log(`%c${msg}`, "color: red; font-weight: bold;");
 };
 
 Bun.listen<SocketData>({
@@ -212,9 +298,19 @@ Bun.listen<SocketData>({
     async data(localSocket, clientData: Uint8Array) {
       const sockData = localSocket.data;
 
-      // 追加数据到缓冲区
-      appendToBuffer(sockData, clientData);
-      const bufferData = getBufferData(sockData);
+      let bufferData = clientData;
+
+      if (!sockData.isHandshakeDone) {
+        // 追加数据到缓冲区
+        appendToBuffer(sockData, clientData);
+        bufferData = getBufferData(sockData);
+      } else {
+        if (sockData.bufferLen > 0) {
+          throw new Error("Unexpected buffered data after handshake completion");
+        }
+        sockData.buffer = clientData;
+        sockData.bufferLen = clientData.length;
+      }
 
       // 握手
       if (sockData.stage === 0) {
@@ -306,8 +402,20 @@ Bun.listen<SocketData>({
       else if (sockData.stage === 2) {
         console.log(`[TCP] 请求数据 ${bufferData.length} bytes`);
         if (!sockData.isHandshakeDone) {
+          if (sockData.count === 0) {
+            console.warn(bufferData);
+          } else {
+            console.warn(
+              "客户端没有等我这里处理完上一个请求就又发了新数据过来，这个时候我只能先把数据放在缓冲区里，等我处理完上一个请求再来处理这个数据",
+            );
+            return; // 等待上一个请求处理完
+          }
+
+          sockData.count++;
+
           // 最少需要 4 字节：[VER, CMD, RSV, ATYP]
           if (bufferData.length < 4) {
+            console.warn("Not enough data for request header, waiting for more...");
             return; // 等待更多数据
           }
 
@@ -315,6 +423,7 @@ Bun.listen<SocketData>({
           const parsed = tryParseAddr(bufferData);
           console.log("Parsed request address:", parsed);
           if (!parsed) {
+            console.warn("Failed to parse request address, waiting for more data...");
             return; // 等待更多数据
           }
 
@@ -323,6 +432,7 @@ Bun.listen<SocketData>({
           console.log("Processing SOCKS5 request...", { cmd });
 
           if (cmd === CONNECT) {
+            consoleLogRed(`[TCP] ${host}:${port} 请求 CONNECT`);
             try {
               const tcpRedirect = await Bun.connect({
                 hostname: host,
@@ -333,10 +443,7 @@ Bun.listen<SocketData>({
                     console.log(`[TCP] ${host}:${port} 连接建立`);
                   },
                   data(remote, data: Uint8Array) {
-                    console.log(
-                      `[TCP] 远程数据: ${data.length} bytes`,
-                      new TextDecoder().decode(data),
-                    );
+                    console.log(`[TCP] 响应数据 ${data.length} bytes`);
                     localSocket.write(data);
                   },
                   error(remote, err) {
@@ -370,6 +477,7 @@ Bun.listen<SocketData>({
               localSocket.end();
             }
           } else if (cmd === BIND) {
+            consoleLogRed(`[BIND] ${host}:${port} 请求 BIND`);
             try {
               const bindServer = Bun.listen({
                 hostname: "::",
@@ -382,15 +490,15 @@ Bun.listen<SocketData>({
                       reply(SUCCESS, boundSocket.remoteAddress, boundSocket.remotePort),
                     );
                     sockData.tcpSocket = boundSocket;
-                    console.log(`[BIND] 远程连接建立，准备转发数据`);
+                    consoleLogRed(`[BIND] 远程连接建立，准备转发数据`);
                   },
                   data(boundSocket, data: Uint8Array) {
-                    console.log(`[BIND] 转发数据 ${data.length} bytes`);
+                    consoleLogRed(`[BIND] 转发数据 ${data.length} bytes`);
                     console.log("BIND数据：", new TextDecoder().decode(data));
                     localSocket.write(data);
                   },
                   close(boundSocket) {
-                    console.log("BIND remote closed");
+                    consoleLogRed("BIND remote closed");
                     localSocket.end();
                   },
                   error(boundSocket, err) {
@@ -417,7 +525,7 @@ Bun.listen<SocketData>({
               localSocket.end();
             }
           } else if (cmd === UDP_ASSOCIATE) {
-            console.log(
+            consoleLogRed(
               `[UDP+++++++] ${localSocket.remoteAddress}:${localSocket.remotePort} 请求 UDP 关联`,
             );
 
@@ -443,30 +551,130 @@ Bun.listen<SocketData>({
                     }
                     const payload = clientUdpData.subarray(addr.offset);
 
-                    const udpClient = await Bun.udpSocket({
-                      port: 0,
-                      hostname: "::",
-                      binaryType: "uint8array",
-                      socket: {
-                        data(out, res) {
-                          const addrBuf = clientUdpData.subarray(3, addr.offset); // ATYP + DST.ADDR + DST.PORT
-                          const packet = new Uint8Array(3 + addrBuf.length + res.length);
-                          const dataView = new DataView(packet.buffer);
-                          dataView.setUint16(0, 0); // RSV
-                          dataView.setUint8(2, 0); // FRAG
-                          packet.set(addrBuf, 3); // ATYP + DST.ADDR + DST.PORT
-                          packet.set(res, 3 + addrBuf.length); // DATA'
+                    const clientKey = `${host}:${port}`;
 
-                          socks5.send(packet, port, host);
-                          out.close();
+                    const cachedSocket = sockData.udpCache.get(clientKey);
+                    if (cachedSocket) {
+                      try {
+                        cachedSocket.send(payload);
+                        return;
+                      } catch (e) {
+                        console.error("UDP send error with cached socket:", e);
+                        sockData.udpCache.delete(clientKey);
+                      }
+                    }
+
+                    let finalIp = addr.host;
+
+                    if (getStrType(addr.host) === DOMAIN) {
+                      const cachedIp = sockData.dnsCache.get(addr.host);
+                      if (cachedIp) {
+                        finalIp = cachedIp;
+                      } else {
+                        // 这里应该实现 DNS 查询逻辑
+                        const arr = await Bun.dns.lookup(addr.host);
+                        const arr6 = arr.filter((item) => item.family === 6);
+                        const arr4 = arr.filter((item) => item.family === 4);
+
+                        const tempUdpClient = await Bun.udpSocket({
+                          port: 0,
+                          hostname: "::",
+                          binaryType: "uint8array",
+                          socket: {
+                            data(out, res) {
+                              console.log(
+                                `[UDP Temp Client] 收到数据 ${res.length} bytes 来自 ${addr.host}:${addr.port}`,
+                              );
+                              out.close();
+                            },
+                            error(out, err) {
+                              console.error("[UDP Temp Client] error:", err);
+                              // out.close();
+                            },
+                          },
+                        });
+
+                        let sent = false;
+
+                        for (const { address } of arr6) {
+                          try {
+                            tempUdpClient.send(payload, addr.port, address);
+                            sockData.dnsCache.set(addr.host, address);
+                            sent = true;
+                            break; // 优先使用 IPv6 地址
+                          } catch (e) {
+                            console.error("UDP send error for IPv6 address:", address, e);
+                          }
+                        }
+                        if (!sent) {
+                          for (const { address } of arr4) {
+                            try {
+                              tempUdpClient.send(payload, addr.port, address);
+                              sockData.dnsCache.set(addr.host, address);
+                              sent = true;
+                              break;
+                            } catch (e) {
+                              console.error("UDP send error for IPv4 address:", address, e);
+                            }
+                          }
+                        }
+                        tempUdpClient.close();
+                        if (!sent) {
+                          console.error(
+                            `Failed to send UDP packet: no valid IP addresses found for ${addr.host}`,
+                          );
+                          return;
+                        } else {
+                          finalIp = sockData.dnsCache.get(addr.host) || addr.host;
+                        }
+                      }
+                    }
+
+                    try {
+                      const udpClient = await Bun.udpSocket({
+                        port: 0,
+                        hostname: "::",
+                        binaryType: "uint8array",
+                        socket: {
+                          data(out, res) {
+                            const addrBuf = clientUdpData.subarray(3, addr.offset); // ATYP + DST.ADDR + DST.PORT
+                            const packet = new Uint8Array(3 + addrBuf.length + res.length);
+                            const dataView = new DataView(packet.buffer);
+                            dataView.setUint16(0, 0); // RSV
+                            dataView.setUint8(2, 0); // FRAG
+                            packet.set(addrBuf, 3); // ATYP + DST.ADDR + DST.PORT
+                            packet.set(res, 3 + addrBuf.length); // DATA'
+
+                            try {
+                              console.log(
+                                `[UDP] 转发响应数据 ${res.length} bytes 到 ${host}:${port}`,
+                              );
+                              socks5.send(packet, port, host);
+                            } catch (e) {
+                              console.error("UDP send error to client:", e);
+                            }
+
+                            out.close();
+                          },
+                          error(out, err) {
+                            console.error("[UDP Client] send error:", err);
+                            out.close();
+                          },
                         },
-                        error(out, err) {
-                          console.error("[UDP Client] send error:", err);
-                          out.close();
+                        connect: {
+                          hostname: finalIp,
+                          port: addr.port,
                         },
-                      },
-                    });
-                    udpClient.send(payload, addr.port, addr.host);
+                      });
+                      console.log(
+                        `[UDP] 转发数据 ${payload.length} bytes 到 ${addr.host}:${addr.port}`,
+                      );
+                      udpClient.send(payload);
+                      sockData.udpCache.set(clientKey, udpClient);
+                      console.log(`[UDP] 已缓存 UDP 关联 ${clientKey} => ${finalIp}:${addr.port}`);
+                    } catch (e) {
+                      console.error(`UDP send to ${finalIp}:${addr.port} error:`, e);
+                    }
                   },
                 },
               });
@@ -511,7 +719,6 @@ Bun.listen<SocketData>({
           const tcpSocket = sockData.tcpSocket;
           if (tcpSocket) {
             try {
-              console.log(`[TCP] 转发数据 ${sockData.bufferLen} bytes`);
               // 转发缓冲区中的所有数据
               tcpSocket.write(bufferData);
               // 清空缓冲区
@@ -533,6 +740,9 @@ Bun.listen<SocketData>({
         isHandshakeDone: false,
         buffer: new Uint8Array(4096), // 初始缓冲区 4KB
         bufferLen: 0,
+        count: 0,
+        dnsCache: new DNSCache(), // 初始化 DNS 缓存
+        udpCache: new Map(), // 初始化 UDP 关联的客户端地址缓存
       };
       console.log(`Client ${socket.remoteAddress}:${socket.remotePort} connected`);
     },
@@ -542,6 +752,8 @@ Bun.listen<SocketData>({
         socket.data.tcpSocket.end();
       }
       if (socket.data.udpSocket) {
+        socket.data.udpCache.forEach((udpClient) => udpClient.close());
+        socket.data.udpCache.clear();
         socket.data.udpSocket.close();
       }
       if (socket.data.bindServer) {
