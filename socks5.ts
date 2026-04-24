@@ -88,50 +88,6 @@ function encodeIPv6(host: string): Uint8Array {
   return buf;
 }
 
-function compressIPv6(ipv6: string): string {
-  // 将连续的多个全零组压缩为 ::
-  const parts = ipv6.split(":");
-  let bestStart = -1;
-  let bestLen = 0;
-
-  // 找到最长的连续零序列（至少2个或更多）
-  let currentStart = -1;
-  let currentLen = 0;
-
-  for (let i = 0; i < parts.length; i++) {
-    if (parts[i] === "0") {
-      if (currentStart === -1) {
-        currentStart = i;
-        currentLen = 1;
-      } else {
-        currentLen++;
-      }
-    } else {
-      if (currentLen >= 2 && currentLen > bestLen) {
-        // 只压缩2个或更多连续的零
-        bestStart = currentStart;
-        bestLen = currentLen;
-      }
-      currentStart = -1;
-      currentLen = 0;
-    }
-  }
-
-  // 检查末尾的零序列
-  if (currentLen >= 2 && currentLen > bestLen) {
-    bestStart = currentStart;
-    bestLen = currentLen;
-  }
-
-  if (bestLen >= 2) {
-    const before = parts.slice(0, bestStart);
-    const after = parts.slice(bestStart + bestLen);
-    return before.join(":") + "::" + after.join(":");
-  }
-
-  return ipv6;
-}
-
 // 解析目标地址（纯 Bun Buffer）
 function parseAddr(data: Uint8Array) {
   const subBuf = new Uint8Array(data.buffer, 3);
@@ -152,15 +108,6 @@ function parseAddr(data: Uint8Array) {
   } else if (atyp === DOMAIN) {
     const len = subBuf[1];
     // 域名地址需要 1 字节长度 + 域名 + 2 字节端口
-    console.warn(
-      "Domain address length:",
-      len,
-      "bytes",
-      data.length,
-      "bytes total",
-      portOffset,
-      len,
-    );
     if (!len || data.length < portOffset + 1 + len + 2) {
       throw new Error("Invalid domain address");
     }
@@ -177,7 +124,6 @@ function parseAddr(data: Uint8Array) {
       parts.push(dataView.getUint16(portOffset + i * 2, false).toString(16));
     }
     host = parts.join(":");
-    console.warn("Parsed IPv6 address:", host);
     portOffset += 16;
   } else {
     return null;
@@ -286,10 +232,6 @@ type SocketData = {
   udpCache: Map<string, Bun.udp.ConnectedSocket<"uint8array">>; // UDP 关联的客户端地址缓存
 };
 
-const consoleLogRed = (msg: string) => {
-  console.log(`%c${msg}`, "color: red; font-weight: bold;");
-};
-
 Bun.listen<SocketData>({
   hostname: CONFIG.host,
   port: CONFIG.port,
@@ -354,10 +296,6 @@ Bun.listen<SocketData>({
         // 消费缓冲区中的数据
         consumeBuffer(sockData, 2 + nmethods);
         sockData.stage = needAuth ? 1 : 2;
-        console.log(
-          `[TCP] ${localSocket.remoteAddress}:${localSocket.remotePort} 连接成功，认证方式: ${needAuth ? "用户名密码" : "无"}`,
-        );
-        console.warn(sockData.bufferLen, "bytes remaining in buffer after handshake");
       }
 
       // 认证
@@ -400,50 +338,36 @@ Bun.listen<SocketData>({
 
       // 请求
       else if (sockData.stage === 2) {
-        console.log(`[TCP] 请求数据 ${bufferData.length} bytes`);
         if (!sockData.isHandshakeDone) {
-          if (sockData.count === 0) {
-            console.warn(bufferData);
-          } else {
-            console.warn(
-              "客户端没有等我这里处理完上一个请求就又发了新数据过来，这个时候我只能先把数据放在缓冲区里，等我处理完上一个请求再来处理这个数据",
-            );
+          if (sockData.count !== 0) {
             return; // 等待上一个请求处理完
+            // 这里也许会有问题
           }
-
           sockData.count++;
 
           // 最少需要 4 字节：[VER, CMD, RSV, ATYP]
           if (bufferData.length < 4) {
-            console.warn("Not enough data for request header, waiting for more...");
             return; // 等待更多数据
           }
 
           // 尝试解析地址，如果不完整则返回 null
           const parsed = tryParseAddr(bufferData);
-          console.log("Parsed request address:", parsed);
           if (!parsed) {
-            console.warn("Failed to parse request address, waiting for more data...");
             return; // 等待更多数据
           }
 
           const { host, port, offset: addrOffset } = parsed;
           const cmd = bufferData[1];
-          console.log("Processing SOCKS5 request...", { cmd });
 
           if (cmd === CONNECT) {
-            consoleLogRed(`[TCP] ${host}:${port} 请求 CONNECT`);
             try {
               const tcpRedirect = await Bun.connect({
                 hostname: host,
                 port: port,
                 socket: {
                   binaryType: "uint8array",
-                  open(remote) {
-                    console.log(`[TCP] ${host}:${port} 连接建立`);
-                  },
+                  open(remote) {},
                   data(remote, data: Uint8Array) {
-                    console.log(`[TCP] 响应数据 ${data.length} bytes`);
                     localSocket.write(data);
                   },
                   error(remote, err) {
@@ -452,15 +376,11 @@ Bun.listen<SocketData>({
                     localSocket.end();
                   },
                   close(remote) {
-                    console.log("Remote closed");
                     localSocket.end();
                   },
                 },
               });
 
-              console.log(
-                `[TCP] ${host}:${port} 连接成功,准备转发数据 BND: port:${tcpRedirect.localPort}`,
-              );
               sockData.tcpSocket = tcpRedirect;
               sockData.isHandshakeDone = true;
               sockData.socketType = "tcp";
@@ -468,19 +388,13 @@ Bun.listen<SocketData>({
               // 消费缓冲区中已处理的请求数据
               consumeBuffer(sockData, addrOffset);
 
-              const res = reply(SUCCESS, tcpRedirect.localAddress, tcpRedirect.localPort);
-              console.log("Sending SOCKS5 response:", res, res.length, "bytes");
-
               localSocket.write(reply(SUCCESS));
-
-              console.warn(sockData.bufferLen, "bytes remaining in buffer after request");
             } catch (e) {
               console.error("Failed to establish connection:", host, port, e);
               localSocket.write(reply(ERR_CONN_REFUSED));
               localSocket.end();
             }
           } else if (cmd === BIND) {
-            consoleLogRed(`[BIND] ${host}:${port} 请求 BIND`);
             try {
               const bindServer = Bun.listen({
                 hostname: "::",
@@ -493,15 +407,11 @@ Bun.listen<SocketData>({
                       reply(SUCCESS, boundSocket.remoteAddress, boundSocket.remotePort),
                     );
                     sockData.tcpSocket = boundSocket;
-                    consoleLogRed(`[BIND] 远程连接建立，准备转发数据`);
                   },
                   data(boundSocket, data: Uint8Array) {
-                    consoleLogRed(`[BIND] 转发数据 ${data.length} bytes`);
-                    console.log("BIND数据：", new TextDecoder().decode(data));
                     localSocket.write(data);
                   },
                   close(boundSocket) {
-                    consoleLogRed("BIND remote closed");
                     localSocket.end();
                   },
                   error(boundSocket, err) {
@@ -520,18 +430,12 @@ Bun.listen<SocketData>({
 
               // 发送第一个回复：BND.ADDR 和 BND.PORT
               localSocket.write(reply(SUCCESS, bindServer.hostname, bindServer.port));
-
-              console.log(`[BIND] 绑定端口 ${bindServer.hostname}:${bindServer.port} 成功`);
             } catch (e) {
               console.error("BIND error:", e);
               localSocket.write(reply(ERR_GENERAL));
               localSocket.end();
             }
           } else if (cmd === UDP_ASSOCIATE) {
-            consoleLogRed(
-              `[UDP+++++++] ${localSocket.remoteAddress}:${localSocket.remotePort} 请求 UDP 关联`,
-            );
-
             try {
               const udpRedirect = await Bun.udpSocket({
                 port: 0,
@@ -539,7 +443,6 @@ Bun.listen<SocketData>({
                 binaryType: "uint8array",
                 socket: {
                   data: async (socks5, clientUdpData, port, host) => {
-                    // console.log(`[UDP] 收到数据 ${data.length} bytes 来自 ${host}:${port}`);
                     if (clientUdpData[0] || clientUdpData[1] || clientUdpData[2]) {
                       // 不支持分片的 UDP 数据包，RSV 必须为 0，FRAG 必须为 0
                       console.error("Invalid UDP packet header");
@@ -585,9 +488,6 @@ Bun.listen<SocketData>({
                           binaryType: "uint8array",
                           socket: {
                             data(out, res) {
-                              console.log(
-                                `[UDP Temp Client] 收到数据 ${res.length} bytes 来自 ${addr.host}:${addr.port}`,
-                              );
                               out.close();
                             },
                             error(out, err) {
@@ -649,9 +549,6 @@ Bun.listen<SocketData>({
                             packet.set(res, 3 + addrBuf.length); // DATA'
 
                             try {
-                              console.log(
-                                `[UDP] 转发响应数据 ${res.length} bytes 到 ${host}:${port}`,
-                              );
                               socks5.send(packet, port, host);
                             } catch (e) {
                               console.error("UDP send error to client:", e);
@@ -669,12 +566,8 @@ Bun.listen<SocketData>({
                           port: addr.port,
                         },
                       });
-                      console.log(
-                        `[UDP] 转发数据 ${payload.length} bytes 到 ${addr.host}:${addr.port}`,
-                      );
                       udpClient.send(payload);
                       sockData.udpCache.set(clientKey, udpClient);
-                      console.log(`[UDP] 已缓存 UDP 关联 ${clientKey} => ${finalIp}:${addr.port}`);
                     } catch (e) {
                       console.error(`UDP send to ${finalIp}:${addr.port} error:`, e);
                     }
@@ -692,8 +585,6 @@ Bun.listen<SocketData>({
 
               consumeBuffer(sockData, addrOffset);
               localSocket.write(res);
-
-              console.log(`[UDP] ${host}:${port} 连接成功,准备转发数据`);
             } catch (e) {
               console.error("UDP association error:", e);
               localSocket.write(reply(ERR_GENERAL));
@@ -747,10 +638,8 @@ Bun.listen<SocketData>({
         dnsCache: new DNSCache(), // 初始化 DNS 缓存
         udpCache: new Map(), // 初始化 UDP 关联的客户端地址缓存
       };
-      console.log(`Client ${socket.remoteAddress}:${socket.remotePort} connected`);
     },
     close(socket) {
-      console.log(`Client closed`);
       if (socket.data.tcpSocket) {
         socket.data.tcpSocket.end();
       }
