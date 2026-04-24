@@ -36,7 +36,7 @@ function getStrType(str: string) {
   }
 }
 
-function buildAddr(host: string, port: number): Uint8Array {
+function buildAddr(host: string, port: number): Uint8Array<ArrayBuffer> {
   const type = getStrType(host);
 
   if (type === IPV4) {
@@ -201,13 +201,13 @@ function tryParseAddr(data: Uint8Array) {
 
 // 响应包
 function reply(code: number, bndAddr?: string, bndPort?: number) {
-  let addr: Uint8Array<ArrayBufferLike> = new Uint8Array([IPV4, 0, 0, 0, 0, 0, 0]);
+  let addr = new Uint8Array([IPV4, 0, 0, 0, 0, 0, 0]);
   if (bndAddr && bndPort !== undefined) {
     addr = buildAddr(bndAddr, bndPort);
   }
-  const buf = new Uint8Array(4 + addr.length);
-  buf.set([VER, code, 0, addr[0] ?? IPV4]);
-  buf.set(addr.subarray(1), 4);
+  const buf = new Uint8Array(3 + addr.length);
+  buf.set([VER, code, 0]);
+  buf.set(addr, 3);
   return buf;
 }
 
@@ -467,6 +467,9 @@ Bun.listen<SocketData>({
 
               // 消费缓冲区中已处理的请求数据
               consumeBuffer(sockData, addrOffset);
+
+              const res = reply(SUCCESS, tcpRedirect.localAddress, tcpRedirect.localPort);
+              console.log("Sending SOCKS5 response:", res, res.length, "bytes");
 
               localSocket.write(reply(SUCCESS));
 
