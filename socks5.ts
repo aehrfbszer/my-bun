@@ -1,7 +1,7 @@
 // ========== 纯 Bun 原生 SOCKS5 代理 ==========
 // 无任何 Node.js API，100% 使用 Bun 原生 TCPSocket / UDPSocket
 const CONFIG = {
-  host: "0.0.0.0",
+  host: "::",
   port: 1080,
   auth: {
     enabled: false,
